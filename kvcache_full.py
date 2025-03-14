@@ -110,6 +110,182 @@ def prepare_clusters(text_list, faiss_index_path):
     return faiss_index, clusters
 
 
+def find_similar_documents(query, faiss_index, clusters, text_list, top_k=3):
+    """
+    주어진 쿼리와 가장 유사한 문서들을 검색합니다.
+
+    Args:
+        query: 검색할 쿼리 텍스트
+        faiss_index: FAISS 인덱스
+        clusters: 문서 클러스터 정보
+        text_list: 원본 텍스트 리스트
+        top_k: 반환할 가장 유사한 문서 개수
+
+    Returns:
+        가장 유사한 문서들의 리스트
+    """
+    # 쿼리 임베딩 생성
+    tokenizer, model = load_embedding_model()
+    query_embedding = get_embedding(query, tokenizer, model)
+
+    # FAISS로 가장 가까운 이웃 검색
+    D, I = faiss_index.search(query_embedding, top_k)
+
+    # 검색된 문서들의 클러스터 확인
+    retrieved_clusters = set([clusters[i] for i in I[0]])
+
+    # 검색된 클러스터에서 추가 문서 검색
+    similar_docs = []
+    for cluster_id in retrieved_clusters:
+        cluster_docs = [
+            text_list[i] for i in range(len(text_list)) if clusters[i] == cluster_id
+        ]
+        similar_docs.extend(cluster_docs[:2])  # 각 클러스터에서 최대 2개 문서 선택
+
+    return similar_docs[:top_k]
+
+
+def save_results(output_path: str, results: dict):
+    """
+    실험 결과를 파일에 저장합니다.
+
+    Args:
+        output_path: 결과를 저장할 파일 경로
+        results: 저장할 결과 딕셔너리
+    """
+    with open(output_path, "a") as f:
+        f.write("\n=== Results Update ===\n")
+        f.write(f"Number of samples processed: {len(results['prompts'])}\n")
+        if results["similarity"]:
+            avg_similarity = sum(results["similarity"]) / len(results["similarity"])
+            f.write(f"Average Similarity: {avg_similarity:.4f}\n")
+        avg_cache_time = sum(results["cache_time"]) / len(results["cache_time"])
+        avg_generate_time = sum(results["generate_time"]) / len(
+            results["generate_time"]
+        )
+        f.write(f"Average Cache Time: {avg_cache_time:.2f}s\n")
+        f.write(f"Average Generate Time: {avg_generate_time:.2f}s\n")
+        f.write("=====================\n")
+
+
+def kvcache_test(args: argparse.Namespace):
+    answer_instruction = "Answer the question with a super short answer."
+    text_list, dataset = cagds.get(
+        args.dataset,
+        max_knowledge=args.maxKnowledge,
+        max_paragraph=args.maxParagraph,
+        max_questions=args.maxQuestion,
+    )
+
+    kvcache_path = "./data_cache/cache_knowledges.pt"
+
+    dataset = list(dataset)
+    max_questions = (
+        min(len(dataset), args.maxQuestion)
+        if args.maxQuestion is not None
+        else len(dataset)
+    )
+
+    results = {
+        "cache_time": [],
+        "generate_time": [],
+        "similarity": [],
+        "prompts": [],
+        "responses": [],
+    }
+
+    for id, (question, ground_truth) in enumerate(dataset[:max_questions]):
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+        # 질문과 관련된 문서 검색
+        relevant_docs = find_similar_documents(
+            question, faiss_index, clusters, text_list
+        )
+        knowledges = "\n\n\n".join(relevant_docs)
+
+        # KV Cache 준비
+        cache_t1 = time()
+        knowledge_cache, prepare_time = prepare_kvcache(
+            knowledges, filepath=kvcache_path, answer_instruction=answer_instruction
+        )
+        cache_t2 = time()
+
+        kv_len = knowledge_cache.key_cache[0].shape[-2]
+        print(f"KVcache prepared in {prepare_time} seconds")
+
+        if args.usePrompt:
+            prompt = f"""
+<|begin_of_text|>
+<|start_header_id|>system<|end_header_id|>
+You are an assistant for giving short answers based on given context.<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+Context information is bellow.
+------------------------------------------------
+{knowledges}
+------------------------------------------------
+{answer_instruction}
+Question:
+{question}<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+"""
+            generate_t1 = time()
+            input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+            output = generate(model, input_ids, DynamicCache())
+            generated_text = tokenizer.decode(
+                output[0], skip_special_tokens=True, temperature=None
+            )
+            generate_t2 = time()
+        else:
+            prompt = f"""
+{question}<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+"""
+            generate_t1 = time()
+            clean_up(knowledge_cache, kv_len)
+            input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+            output = generate(model, input_ids, knowledge_cache)
+            generated_text = tokenizer.decode(
+                output[0], skip_special_tokens=True, temperature=None
+            )
+            generate_t2 = time()
+
+        print("Q: ", question)
+        print("A: ", generated_text)
+
+        # Evaluate bert-score similarity
+        similarity = cagsim.bert(generated_text, ground_truth)
+
+        print(
+            f"[{id}]: Semantic Similarity: {round(similarity, 5)},",
+            f"cache time: {cache_t2 - cache_t1},",
+            f"generate time: {generate_t2 - generate_t1}",
+        )
+
+        results["prompts"].append(question)
+        results["responses"].append(generated_text)
+        results["cache_time"].append(cache_t2 - cache_t1)
+        results["generate_time"].append(generate_t2 - generate_t1)
+        results["similarity"].append(similarity)
+
+        # 10개 질문마다 중간 결과 저장
+        if (id + 1) % 10 == 0:
+            save_results(args.output, results)
+
+    # 최종 결과 저장
+    save_results(args.output, results)
+
+    # 평균 계산
+    avg_similarity = sum(results["similarity"]) / len(results["similarity"])
+    avg_cache_time = sum(results["cache_time"]) / len(results["cache_time"])
+    avg_generate_time = sum(results["generate_time"]) / len(results["generate_time"])
+
+    print(f"\nFinal Results:")
+    print(f"Average Semantic Similarity: {avg_similarity:.4f}")
+    print(f"Average Cache Time: {avg_cache_time:.2f}s")
+    print(f"Average Generate Time: {avg_generate_time:.2f}s")
+
+
 # ------------------------------------------------
 
 
@@ -237,142 +413,6 @@ def prepare_kvcache(
     t2 = time()
     logger.info(f"KV cache prepared in {t2 - t1:.2f} seconds.")
     return kv, t2 - t1
-
-
-def kvcache_test(args: argparse.Namespace):
-    answer_instruction = "Answer the question with a super short answer."
-    text_list, dataset = cagds.get(
-        args.dataset,
-        max_knowledge=args.maxKnowledge,
-        max_paragraph=args.maxParagraph,
-        max_questions=args.maxQuestion,
-    )
-
-    kvcache_path = "./data_cache/cache_knowledges.pt"
-
-    knowledges = "\n\n\n\n\n\n".join(text_list)
-    knowledge_cache, prepare_time = prepare_kvcache(
-        knowledges, filepath=kvcache_path, answer_instruction=answer_instruction
-    )
-    kv_len = knowledge_cache.key_cache[0].shape[-2]
-    print(f"KVcache prepared in {prepare_time} seconds")
-    with open(args.output, "a") as f:
-        f.write(f"KVcache prepared in {prepare_time} seconds\n")
-
-    results = {
-        "cache_time": [],
-        "generate_time": [],
-        "similarity": [],
-        "prompts": [],
-        "responses": [],
-    }
-
-    dataset = list(dataset)  # Convert the dataset to a list
-
-    max_questions = (
-        min(len(dataset), args.maxQuestion)
-        if args.maxQuestion is not None
-        else len(dataset)
-    )
-    # Retrieve the knowledge from the vector database
-    for id, (question, ground_truth) in enumerate(dataset[:max_questions]):
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-        # Read the knowledge cache from the cache file
-        cache_t1 = time()
-        # if args.kvcache == "file":
-        #     knowledge_cache = read_kv_cache(kvcache_path)
-
-        # Not a good idea to use this method, as it will consume a lot of memory
-        # if args.kvcache == "variable":
-        #     knowledge_cache = documents_cache
-        cache_t2 = time()
-
-        # Generate Response for the question
-        knowledges = "\n\n\n".join(text_list)
-
-        if args.usePrompt:
-            prompt = f"""
-    <|begin_of_text|>
-    <|start_header_id|>system<|end_header_id|>
-    You are an assistant for giving short answers based on given context.<|eot_id|>
-    <|start_header_id|>user<|end_header_id|>
-    Context information is bellow.
-    ------------------------------------------------
-    {knowledges}
-    ------------------------------------------------
-    {answer_instruction}
-    Question:
-    {question}<|eot_id|>
-    <|start_header_id|>assistant<|end_header_id|>
-    """
-            generate_t1 = time()
-            input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-            output = generate(model, input_ids, DynamicCache())
-            generated_text = tokenizer.decode(
-                output[0], skip_special_tokens=True, temperature=None
-            )
-            generate_t2 = time()
-        else:
-            prompt = f"""
-    {question}<|eot_id|>
-    <|start_header_id|>assistant<|end_header_id|>
-    """
-            generate_t1 = time()
-            clean_up(knowledge_cache, kv_len)
-            input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-            output = generate(model, input_ids, knowledge_cache)
-            generated_text = tokenizer.decode(
-                output[0], skip_special_tokens=True, temperature=None
-            )
-            generate_t2 = time()
-
-        # print("D: ", knowledges)
-        print("Q: ", question)
-        print("A: ", generated_text)
-
-        # Evaluate bert-score similarity
-        similarity = cagsim.bert(generated_text, ground_truth)
-
-        print(
-            f"[{id}]: Semantic Similarity: {round(similarity, 5)},",
-            f"cache time: {cache_t2 - cache_t1},",
-            f"generate time: {generate_t2 - generate_t1}",
-        )
-        with open(args.output, "a") as f:
-            f.write(
-                f"[{id}]: Semantic Similarity: {round(similarity, 5)},\t cache time: {cache_t2 - cache_t1},\t generate time: {generate_t2 - generate_t1}\n"
-            )
-
-        results["prompts"].append(question)
-        results["responses"].append(generated_text)
-        results["cache_time"].append(cache_t2 - cache_t1)
-        results["generate_time"].append(generate_t2 - generate_t1)
-        results["similarity"].append(similarity)
-
-        with open(args.output, "a") as f:
-            f.write(
-                f"[{id}]: [Cumulative]: "
-                + f"Semantic Similarity: {round(sum(results['similarity']) / (len(results['similarity'])) , 5)},"
-                + f"\t cache time: {sum(results['cache_time']) / (len(results['cache_time'])) },"
-                + f"\t generate time: {sum(results['generate_time']) / (len(results['generate_time'])) }\n"
-            )
-
-    avg_similarity = sum(results["similarity"]) / len(results["similarity"])
-    avg_cache_time = sum(results["cache_time"]) / len(results["cache_time"])
-    avg_generate_time = sum(results["generate_time"]) / len(results["generate_time"])
-    print()
-    print(f"Prepare time: {prepare_time}")
-    print(f"Average Semantic Similarity: {avg_similarity}")
-    print(f"cache time: {avg_cache_time},\t generate time: {avg_generate_time}")
-    print()
-    with open(args.output, "a") as f:
-        f.write("\n")
-        f.write(f"Result for {args.output}\n")
-        f.write(f"Prepare time: {prepare_time}\n")
-        f.write(f"Average Semantic Similarity: {avg_similarity}\n")
-        f.write(f"cache time: {avg_cache_time},\t generate time: {avg_generate_time}\n")
 
 
 # Define quantization configuration
