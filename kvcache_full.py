@@ -4,18 +4,26 @@ import os
 import cag.dataset as cagds
 import cag.similarity as cagsim
 from time import time
-from transformers import BitsAndBytesConfig, AutoTokenizer, AutoModelForCausalLM, AutoModel
+from transformers import (
+    BitsAndBytesConfig,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    AutoModel,
+)
 from transformers.cache_utils import DynamicCache
-import logging 
-import faiss # Add FAISS 
-import numpy as np # Add numpy
-from sklearn.cluster import KMeans # Add KMeans 
+import logging
+import faiss  # Add FAISS
+import numpy as np  # Add numpy
+from sklearn.cluster import KMeans  # Add KMeans
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -38,47 +46,62 @@ torch.serialization.add_safe_globals([set])
 # Add embedding model
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
+
 def load_embedding_model():
     tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL)
     model = AutoModel.from_pretrained(EMBEDDING_MODEL).to(device)
     return tokenizer, model
 
+
 def get_embedding(text, tokenizer, model):
-    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+    inputs = tokenizer(
+        text, return_tensors="pt", padding=True, truncation=True, max_length=512
+    ).to(device)
     with torch.no_grad():
         outputs = model(**inputs)
     return outputs.last_hidden_state[:, 0, :].cpu().numpy()
 
+
 def store_embeddings_faiss(text_list, faiss_index_path):
     tokenizer, model = load_embedding_model()
-    embeddings = np.array([get_embedding(text, tokenizer, model) for text in text_list]).squeeze()
-    
+    embeddings = np.array(
+        [get_embedding(text, tokenizer, model) for text in text_list]
+    ).squeeze()
+
     # Create FAISS index
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
     faiss.write_index(index, faiss_index_path)
     return index
 
+
 def load_faiss_index(faiss_index_path):
     return faiss.read_index(faiss_index_path)
 
+
 def perform_kmeans_clustering(faiss_index, num_clusters):
-    embeddings = np.array([faiss_index.reconstruct(i) for i in range(faiss_index.ntotal)])
+    embeddings = np.array(
+        [faiss_index.reconstruct(i) for i in range(faiss_index.ntotal)]
+    )
     kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
     clusters = kmeans.fit_predict(embeddings)
     return clusters, kmeans
 
+
 def optimal_k(faiss_index, max_k=10):
-    embeddings = np.array([faiss_index.reconstruct(i) for i in range(faiss_index.ntotal)])
+    embeddings = np.array(
+        [faiss_index.reconstruct(i) for i in range(faiss_index.ntotal)]
+    )
     distortions = []
     for k in range(2, max_k + 1):
         kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
         kmeans.fit(embeddings)
         distortions.append(kmeans.inertia_)
-    
+
     # Elbow method heuristic (return optimal-k)
     deltas = np.diff(distortions)
     return np.argmin(deltas) + 2
+
 
 def prepare_clusters(text_list, faiss_index_path):
     faiss_index = store_embeddings_faiss(text_list, faiss_index_path)
@@ -86,13 +109,12 @@ def prepare_clusters(text_list, faiss_index_path):
     clusters, kmeans = perform_kmeans_clustering(faiss_index, k)
     return faiss_index, clusters
 
-#------------------------------------------------
+
+# ------------------------------------------------
+
 
 def generate(
-    model,
-    input_ids: torch.Tensor,
-    past_key_values,
-    max_new_tokens: int = 300
+    model, input_ids: torch.Tensor, past_key_values, max_new_tokens: int = 300
 ) -> torch.Tensor:
     """
     Generate text with greedy decoding.
@@ -113,9 +135,7 @@ def generate(
     with torch.no_grad():
         for _ in range(max_new_tokens):
             outputs = model(
-                input_ids=next_token, 
-                past_key_values=past_key_values,
-                use_cache=True
+                input_ids=next_token, past_key_values=past_key_values, use_cache=True
             )
             next_token_logits = outputs.logits[:, -1, :]
             next_token = next_token_logits.argmax(dim=-1).unsqueeze(-1)
@@ -127,7 +147,7 @@ def generate(
 
             if next_token.item() in model.config.eos_token_id:
                 break
-    return output_ids[:, origin_ids.shape[-1]:]
+    return output_ids[:, origin_ids.shape[-1] :]
 
 
 def preprocess_knowledge(
@@ -153,7 +173,7 @@ def preprocess_knowledge(
             past_key_values=past_key_values,
             use_cache=True,
             output_attentions=False,
-            output_hidden_states=False
+            output_hidden_states=False,
         )
     return outputs.past_key_values
 
@@ -188,7 +208,11 @@ def read_kv_cache(path: str) -> DynamicCache | None:
         return None
 
 
-def prepare_kvcache(documents, filepath: str = "./data_cache/cache_knowledges.pt", answer_instruction: str | None = None):
+def prepare_kvcache(
+    documents,
+    filepath: str = "./data_cache/cache_knowledges.pt",
+    answer_instruction: str | None = None,
+):
     # Prepare the knowledges kvcache
 
     if answer_instruction is None:
@@ -217,12 +241,19 @@ def prepare_kvcache(documents, filepath: str = "./data_cache/cache_knowledges.pt
 
 def kvcache_test(args: argparse.Namespace):
     answer_instruction = "Answer the question with a super short answer."
-    text_list, dataset = cagds.get(args.dataset, max_knowledge=args.maxKnowledge, max_paragraph=args.maxParagraph, max_questions=args.maxQuestion)
+    text_list, dataset = cagds.get(
+        args.dataset,
+        max_knowledge=args.maxKnowledge,
+        max_paragraph=args.maxParagraph,
+        max_questions=args.maxQuestion,
+    )
 
     kvcache_path = "./data_cache/cache_knowledges.pt"
 
-    knowledges = '\n\n\n\n\n\n'.join(text_list)
-    knowledge_cache, prepare_time = prepare_kvcache(knowledges, filepath=kvcache_path, answer_instruction=answer_instruction)
+    knowledges = "\n\n\n\n\n\n".join(text_list)
+    knowledge_cache, prepare_time = prepare_kvcache(
+        knowledges, filepath=kvcache_path, answer_instruction=answer_instruction
+    )
     kv_len = knowledge_cache.key_cache[0].shape[-2]
     print(f"KVcache prepared in {prepare_time} seconds")
     with open(args.output, "a") as f:
@@ -233,12 +264,16 @@ def kvcache_test(args: argparse.Namespace):
         "generate_time": [],
         "similarity": [],
         "prompts": [],
-        "responses": []
+        "responses": [],
     }
 
     dataset = list(dataset)  # Convert the dataset to a list
 
-    max_questions = min(len(dataset), args.maxQuestion) if args.maxQuestion is not None else len(dataset)
+    max_questions = (
+        min(len(dataset), args.maxQuestion)
+        if args.maxQuestion is not None
+        else len(dataset)
+    )
     # Retrieve the knowledge from the vector database
     for id, (question, ground_truth) in enumerate(dataset[:max_questions]):
         torch.cuda.empty_cache()
@@ -255,7 +290,7 @@ def kvcache_test(args: argparse.Namespace):
         cache_t2 = time()
 
         # Generate Response for the question
-        knowledges = '\n\n\n'.join(text_list)
+        knowledges = "\n\n\n".join(text_list)
 
         if args.usePrompt:
             prompt = f"""
@@ -274,8 +309,10 @@ def kvcache_test(args: argparse.Namespace):
     """
             generate_t1 = time()
             input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-            output = generate(model, input_ids, DynamicCache()) 
-            generated_text = tokenizer.decode(output[0], skip_special_tokens=True, temperature=None)
+            output = generate(model, input_ids, DynamicCache())
+            generated_text = tokenizer.decode(
+                output[0], skip_special_tokens=True, temperature=None
+            )
             generate_t2 = time()
         else:
             prompt = f"""
@@ -286,21 +323,27 @@ def kvcache_test(args: argparse.Namespace):
             clean_up(knowledge_cache, kv_len)
             input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
             output = generate(model, input_ids, knowledge_cache)
-            generated_text = tokenizer.decode(output[0], skip_special_tokens=True, temperature=None)
+            generated_text = tokenizer.decode(
+                output[0], skip_special_tokens=True, temperature=None
+            )
             generate_t2 = time()
 
         # print("D: ", knowledges)
         print("Q: ", question)
         print("A: ", generated_text)
- 
+
         # Evaluate bert-score similarity
         similarity = cagsim.bert(generated_text, ground_truth)
 
-        print(f"[{id}]: Semantic Similarity: {round(similarity, 5)},",
-              f"cache time: {cache_t2 - cache_t1},",
-              f"generate time: {generate_t2 - generate_t1}")
+        print(
+            f"[{id}]: Semantic Similarity: {round(similarity, 5)},",
+            f"cache time: {cache_t2 - cache_t1},",
+            f"generate time: {generate_t2 - generate_t1}",
+        )
         with open(args.output, "a") as f:
-            f.write(f"[{id}]: Semantic Similarity: {round(similarity, 5)},\t cache time: {cache_t2 - cache_t1},\t generate time: {generate_t2 - generate_t1}\n")
+            f.write(
+                f"[{id}]: Semantic Similarity: {round(similarity, 5)},\t cache time: {cache_t2 - cache_t1},\t generate time: {generate_t2 - generate_t1}\n"
+            )
 
         results["prompts"].append(question)
         results["responses"].append(generated_text)
@@ -309,10 +352,12 @@ def kvcache_test(args: argparse.Namespace):
         results["similarity"].append(similarity)
 
         with open(args.output, "a") as f:
-            f.write(f"[{id}]: [Cumulative]: "
-                    + f"Semantic Similarity: {round(sum(results['similarity']) / (len(results['similarity'])) , 5)},"
-                    + f"\t cache time: {sum(results['cache_time']) / (len(results['cache_time'])) },"
-                    + f"\t generate time: {sum(results['generate_time']) / (len(results['generate_time'])) }\n")
+            f.write(
+                f"[{id}]: [Cumulative]: "
+                + f"Semantic Similarity: {round(sum(results['similarity']) / (len(results['similarity'])) , 5)},"
+                + f"\t cache time: {sum(results['cache_time']) / (len(results['cache_time'])) },"
+                + f"\t generate time: {sum(results['generate_time']) / (len(results['generate_time'])) }\n"
+            )
 
     avg_similarity = sum(results["similarity"]) / len(results["similarity"])
     avg_cache_time = sum(results["cache_time"]) / len(results["cache_time"])
@@ -332,68 +377,133 @@ def kvcache_test(args: argparse.Namespace):
 
 # Define quantization configuration
 bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,              # Load model in 4-bit precision
-    bnb_4bit_quant_type="nf4",      # Normalize float 4 quantization
+    load_in_4bit=True,  # Load model in 4-bit precision
+    bnb_4bit_quant_type="nf4",  # Normalize float 4 quantization
     bnb_4bit_compute_dtype=torch.float16,  # Compute dtype for 4-bit base matrices
-    bnb_4bit_use_double_quant=True  # Use nested quantization
+    bnb_4bit_use_double_quant=True,  # Use nested quantization
 )
 
 
 def load_quantized_model(model_name, hf_token=None):
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        token=hf_token
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
 
     # Load model with quantization
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=bnb_config,
-        device_map="auto",          # Automatically choose best device
-        trust_remote_code=True,     # Required for some models
-        token=hf_token
+        device_map="auto",  # Automatically choose best device
+        trust_remote_code=True,  # Required for some models
+        token=hf_token,
     )
 
     return tokenizer, model
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run RAG test with specified parameters.")
+    parser = argparse.ArgumentParser(
+        description="Run RAG test with specified parameters."
+    )
     # parser.add_argument('--method', choices=['rag', 'kvcache'], required=True, help='Method to use (rag or kvcache)')
     # parser.add_argument('--kvcache', choices=['file', 'variable'], required=True, help='Method to use (from_file or from_var)')
-    parser.add_argument('--modelname', required=False, default="meta-llama/Llama-3.2-1B-Instruct", type=str, help='Model name to use')
-    parser.add_argument('--quantized', required=False, default=False, type=bool, help='Quantized model')
-    parser.add_argument('--faiss_index', required=True, help='Path to save FAISS index') # Add FAISS index path
-    parser.add_argument('--kvcache', choices=['file'], required=True, help='Method to use (from_file or from_var)')
-    parser.add_argument('--similarity', choices=['bertscore'], required=True, help='Similarity metric to use (bertscore)')
-    parser.add_argument('--output', required=True, type=str, help='Output file to save the results')
-    parser.add_argument('--maxQuestion', required=False, default=None, type=int, help='Maximum number of questions to test')
-    parser.add_argument('--maxKnowledge', required=False, default=None, type=int, help='Maximum number of knowledge items to use')
-    parser.add_argument('--maxParagraph', required=False, default=None, type=int, help='Maximum number of paragraph to use')
-    parser.add_argument('--usePrompt', default=False, action="store_true", help='Do not use cache')
-    parser.add_argument('--dataset', required=True, help='Dataset to use (kis, kis_sample, squad-dev, squad-train)',
-                        choices=['kis', 'kis_sample',
-                                 'squad-dev', 'squad-train',
-                                 'hotpotqa-dev',  'hotpotqa-train', 'hotpotqa-test'])
-    parser.add_argument('--randomSeed', required=False, default=None, type=int, help='Random seed to use')
+    parser.add_argument(
+        "--modelname",
+        required=False,
+        default="meta-llama/Llama-3.2-1B-Instruct",
+        type=str,
+        help="Model name to use",
+    )
+    parser.add_argument(
+        "--quantized", required=False, default=False, type=bool, help="Quantized model"
+    )
+    parser.add_argument(
+        "--faiss_index", required=True, help="Path to save FAISS index"
+    )  # Add FAISS index path
+    parser.add_argument(
+        "--kvcache",
+        choices=["file"],
+        required=True,
+        help="Method to use (from_file or from_var)",
+    )
+    parser.add_argument(
+        "--similarity",
+        choices=["bertscore"],
+        required=True,
+        help="Similarity metric to use (bertscore)",
+    )
+    parser.add_argument(
+        "--output", required=True, type=str, help="Output file to save the results"
+    )
+    parser.add_argument(
+        "--maxQuestion",
+        required=False,
+        default=None,
+        type=int,
+        help="Maximum number of questions to test",
+    )
+    parser.add_argument(
+        "--maxKnowledge",
+        required=False,
+        default=None,
+        type=int,
+        help="Maximum number of knowledge items to use",
+    )
+    parser.add_argument(
+        "--maxParagraph",
+        required=False,
+        default=None,
+        type=int,
+        help="Maximum number of paragraph to use",
+    )
+    parser.add_argument(
+        "--usePrompt", default=False, action="store_true", help="Do not use cache"
+    )
+    parser.add_argument(
+        "--dataset",
+        required=True,
+        help="Dataset to use (kis, kis_sample, squad-dev, squad-train)",
+        choices=[
+            "kis",
+            "kis_sample",
+            "squad-dev",
+            "squad-train",
+            "hotpotqa-dev",
+            "hotpotqa-train",
+            "hotpotqa-test",
+        ],
+    )
+    parser.add_argument(
+        "--randomSeed",
+        required=False,
+        default=None,
+        type=int,
+        help="Random seed to use",
+    )
     # 48 Articles, each article average 40~50 paragraph, each average 5~10 questions
 
     args = parser.parse_args()
 
-    print("maxKnowledge", args.maxKnowledge, "maxParagraph", args.maxParagraph, "maxQuestion", args.maxQuestion, "randomeSeed", args.randomSeed)
+    print(
+        "maxKnowledge",
+        args.maxKnowledge,
+        "maxParagraph",
+        args.maxParagraph,
+        "maxQuestion",
+        args.maxQuestion,
+        "randomeSeed",
+        args.randomSeed,
+    )
 
     model_name = args.modelname
     rand_seed = args.randomSeed if args.randomSeed is not None else None
 
     if args.quantized:
-        tokenizer, model = load_quantized_model(model_name=model_name, hf_token=HF_TOKEN)
+        tokenizer, model = load_quantized_model(
+            model_name=model_name, hf_token=HF_TOKEN
+        )
     else:
         tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
         model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            token=HF_TOKEN
+            model_name, torch_dtype=torch.float16, device_map="auto", token=HF_TOKEN
         )
 
     def unique_path(path, i=0):
