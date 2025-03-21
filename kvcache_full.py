@@ -12,10 +12,8 @@ from transformers import (
 )
 from transformers.cache_utils import DynamicCache
 import logging
-import faiss  # Add FAISS
-import numpy as np  # Add numpy
-from sklearn.cluster import KMeans  # Add KMeans
-
+import faiss   # Add FAISS
+import numpy as np   # Add numpy
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -30,14 +28,11 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 if not HF_TOKEN:
     raise ValueError("HF_TOKEN not found")
 
-
 global model_name, model, tokenizer
 global rand_seed
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {device}")
-
 
 """KV Cache test"""
 torch.serialization.add_safe_globals([DynamicCache])
@@ -46,12 +41,11 @@ torch.serialization.add_safe_globals([set])
 # Add embedding model
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
+# load embedding model
+embedding_tokenizer, embedding_model = AutoTokenizer.from_pretrained(EMBEDDING_MODEL), AutoModel.from_pretrained(EMBEDDING_MODEL).to(device)
 
 def load_embedding_model():
-    tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL)
-    model = AutoModel.from_pretrained(EMBEDDING_MODEL).to(device)
-    return tokenizer, model
-
+    return embedding_tokenizer, embedding_model
 
 def get_embedding(text, tokenizer, model):
     inputs = tokenizer(
@@ -61,58 +55,43 @@ def get_embedding(text, tokenizer, model):
         outputs = model(**inputs)
     return outputs.last_hidden_state[:, 0, :].cpu().numpy()
 
+def get_batch_embeddings(text_list, tokenizer, model):
+    inputs = tokenizer(
+        text_list, return_tensors="pt", padding=True, truncation=True, max_length=512
+    ).to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return outputs.last_hidden_state[:, 0, :].cpu().numpy()
 
-def store_embeddings_faiss(text_list, faiss_index_path):
+def store_embeddings_faiss(text_list, faiss_index_path, nlist=10):
     tokenizer, model = load_embedding_model()
-    embeddings = np.array(
-        [get_embedding(text, tokenizer, model) for text in text_list]
-    ).squeeze()
+    embeddings = get_batch_embeddings(text_list, tokenizer, model)  # 배치 단위 임베딩 처리
 
-    # Create FAISS index
-    index = faiss.IndexFlatL2(embeddings.shape[1])
+    d = embeddings.shape[1]
+    quantizer = faiss.IndexFlatL2(d)
+    
+    index = faiss.IndexIVFFlat(quantizer, d, nlist)
+    
+    index.train(embeddings)
     index.add(embeddings)
-    faiss.write_index(index, faiss_index_path)
-    return index
+    
+    index.nprobe = min(5, nlist)  
 
+    faiss.write_index(index, faiss_index_path)
+    
+    return index
 
 def load_faiss_index(faiss_index_path):
     return faiss.read_index(faiss_index_path)
 
-
-def perform_kmeans_clustering(faiss_index, num_clusters):
-    embeddings = np.array(
-        [faiss_index.reconstruct(i) for i in range(faiss_index.ntotal)]
-    )
-    kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
-    clusters = kmeans.fit_predict(embeddings)
-    return clusters, kmeans
-
-
-def optimal_k(faiss_index, max_k=10):
-    embeddings = np.array(
-        [faiss_index.reconstruct(i) for i in range(faiss_index.ntotal)]
-    )
-    distortions = []
-    for k in range(2, max_k + 1):
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        kmeans.fit(embeddings)
-        distortions.append(kmeans.inertia_)
-
-    # Elbow method heuristic (return optimal-k)
-    deltas = np.diff(distortions)
-    return np.argmin(deltas) + 2
-
-
-def prepare_clusters(text_list, faiss_index_path):
-    faiss_index = store_embeddings_faiss(text_list, faiss_index_path)
-    k = optimal_k(faiss_index)
-    clusters, kmeans = perform_kmeans_clustering(faiss_index, k)
-    return faiss_index, clusters
-
+def prepare_index(text_list, faiss_index_path):
+    if os.path.exists(faiss_index_path):
+        return load_faiss_index(faiss_index_path)
+    return store_embeddings_faiss(text_list, faiss_index_path)
 
 def find_similar_documents(
-    query, faiss_index, clusters, text_list, top_k=3
-):  # 추후 optimal k로 변경
+    query, faiss_index, text_list, top_k=3
+    ):
     """
     주어진 쿼리와 가장 유사한 문서들을 검색합니다.
 
@@ -126,26 +105,17 @@ def find_similar_documents(
     Returns:
         가장 유사한 문서들의 리스트
     """
-    # 쿼리 임베딩 생성
+    # 쿼리 임베딩 생성성
     tokenizer, model = load_embedding_model()
     query_embedding = get_embedding(query, tokenizer, model)
 
     # FAISS로 가장 가까운 이웃 검색
     D, I = faiss_index.search(query_embedding, top_k)
 
-    # 검색된 문서들의 클러스터 확인
-    retrieved_clusters = set([clusters[i] for i in I[0]])
-
     # 검색된 클러스터에서 추가 문서 검색
-    similar_docs = []
-    for cluster_id in retrieved_clusters:
-        cluster_docs = [
-            text_list[i] for i in range(len(text_list)) if clusters[i] == cluster_id
-        ]
-        similar_docs.extend(cluster_docs[:2])  # 각 클러스터에서 최대 2개 문서 선택
+    similar_docs = [text_list[i] for i in I[0]]
 
     return similar_docs[:top_k]
-
 
 def save_results(output_path: str, results: dict):
     """
@@ -162,13 +132,10 @@ def save_results(output_path: str, results: dict):
             avg_similarity = sum(results["similarity"]) / len(results["similarity"])
             f.write(f"Average Similarity: {avg_similarity:.4f}\n")
         avg_cache_time = sum(results["cache_time"]) / len(results["cache_time"])
-        avg_generate_time = sum(results["generate_time"]) / len(
-            results["generate_time"]
-        )
+        avg_generate_time = sum(results["generate_time"]) / len(results["generate_time"])
         f.write(f"Average Cache Time: {avg_cache_time:.2f}s\n")
         f.write(f"Average Generate Time: {avg_generate_time:.2f}s\n")
         f.write("=====================\n")
-
 
 def kvcache_test(args: argparse.Namespace):
     answer_instruction = "Answer the question with a super short answer."
@@ -179,8 +146,10 @@ def kvcache_test(args: argparse.Namespace):
         max_questions=args.maxQuestion,
     )
 
-    kvcache_path = "./data_cache/cache_knowledges.pt"
+    faiss_index_path = "./data_cache/faiss.index"
+    faiss_index = prepare_index(text_list, faiss_index_path)
 
+    kvcache_path = "./data_cache/cache_knowledges.pt"
     dataset = list(dataset)
     max_questions = (
         min(len(dataset), args.maxQuestion)
@@ -202,7 +171,7 @@ def kvcache_test(args: argparse.Namespace):
 
         # 질문과 관련된 문서 검색
         relevant_docs = find_similar_documents(
-            question, faiss_index, clusters, text_list
+            question, faiss_index, text_list
         )
         knowledges = "\n\n\n".join(relevant_docs)
 
