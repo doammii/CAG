@@ -110,7 +110,9 @@ def prepare_clusters(text_list, faiss_index_path):
     return faiss_index, clusters
 
 
-def find_similar_documents(query, faiss_index, clusters, text_list, top_k=3):
+def find_similar_documents(
+    query, faiss_index, clusters, text_list, top_k=3
+):  # 추후 optimal k로 변경
     """
     주어진 쿼리와 가장 유사한 문서들을 검색합니다.
 
